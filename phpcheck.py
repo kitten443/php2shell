@@ -348,7 +348,11 @@ def main(argv=None):
 
     # Массовое сканирование списка сайтов.
     if opts['file']:
-        urls = read_urls(opts['file'])
+        try:
+            urls = read_urls(opts['file'])
+        except OSError as exc:
+            # Файл не найден / нет прав / это каталог — аккуратная ошибка вместо traceback.
+            return _usage_error(f'Не удалось прочитать файл со списком: {exc}')
         if not urls:
             return _usage_error('Файл не содержит ни одного URL')
         return run_bulk(urls, threads, timeout, opts['async'], opts['json'])

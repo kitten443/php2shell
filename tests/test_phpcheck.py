@@ -194,6 +194,9 @@ class BulkScanTests(unittest.TestCase):
         finally:
             os.unlink(empty)
 
+    def test_usage_missing_file(self):
+        self.assertEqual(phpcheck.main(['--file', '/nonexistent/definitely-missing.txt']), 2)
+
 
 if __name__ == '__main__':
     unittest.main()
