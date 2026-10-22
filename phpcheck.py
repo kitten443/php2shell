@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-phpcheck.py — Python 3 port of OpenAI's php2shell-checker (phpcheck.js).
+phpcheck.py — Python 3 порт официального чекера openai/php2shell-checker (phpcheck.js).
 
-Checks a website URL or a local PHP binary and reports whether the PHP
-version is vulnerable to php2shell (CVE-2026-109618 / CVE-2026-109619).
+Проверяет сайт по URL или локальный бинарник PHP и сообщает, уязвима ли версия
+к php2shell (CVE-2026-109618 / CVE-2026-109619).
 
-Exit codes: 0 OK, 1 VULNERABLE, 3 UNKNOWN, 2 usage error.
-Faithful port of the Node.js logic; original (c) OpenAI, Apache-2.0.
+Коды возврата: 0 — OK, 1 — VULNERABLE, 3 — UNKNOWN, 2 — ошибка аргументов.
+Точный порт логики Node.js-версии; оригинал (c) OpenAI, Apache-2.0.
 """
 
 import json
@@ -19,8 +19,9 @@ import urllib.request
 
 VERSION = '1.0.0'
 
-# Vulnerable version cutoffs as of 2026-10-20. A newer stable patch in a
-# listed branch is OK by this table; unlisted branches remain unknown.
+# Пороговые версии уязвимости по веткам (данные на 2026-10-20).
+# Новый стабильный патч в перечисленной ветке считается безопасным;
+# ветки, которых нет в таблице, дают статус UNKNOWN.
 VULNERABLE_THROUGH = {
     '5.4': 45, '5.5': 38, '5.6': 40,
     '7.0': 33, '7.1': 33, '7.2': 34, '7.3': 33, '7.4': 33,
@@ -28,19 +29,22 @@ VULNERABLE_THROUGH = {
 }
 
 USAGE = (
-    'Usage: python3 phpcheck.py URL [--timeout SECONDS] [--json]\n'
-    '       python3 phpcheck.py --local [--php PATH] [--json]\n'
-    '       python3 phpcheck.py --version'
+    'Использование: python3 phpcheck.py URL [--timeout СЕКУНДЫ] [--json]\n'
+    '               python3 phpcheck.py --local [--php ПУТЬ] [--json]\n'
+    '               python3 phpcheck.py --version'
 )
 
+# Коды возврата по статусу проверки.
 EXIT = {'ok': 0, 'vulnerable': 1, 'unknown': 3}
 
+# Шаблон версии X.Y.Z с необязательным суффиксом (-/+...).
 _VERSION_RE = re.compile(r'^(\d+)\.(\d+)\.(\d+)([-+~].*)?$')
+# Признак предрелизной сборки (dev/alpha/beta/rc) в суффиксе.
 _DEV_SUFFIX = re.compile(r'(?:^|[-+~.])(?:dev|alpha|beta|rc)', re.IGNORECASE)
 
 
 def patch_status(version):
-    """Return 'ok', 'vulnerable' or 'unknown' for a PHP version string."""
+    """Вернуть статус 'ok', 'vulnerable' или 'unknown' для строки версии PHP."""
     m = _VERSION_RE.match(version or '')
     if not m:
         return 'unknown'
@@ -49,28 +53,28 @@ def patch_status(version):
         return 'unknown'
     if int(m.group(3)) <= cutoff:
         return 'vulnerable'
-    # A development build of the next patch is not evidence of a stable fix.
+    # Предрелизная сборка следующего патча — ещё не доказательство стабильного фикса.
     if m.group(4) and _DEV_SUFFIX.search(m.group(4)):
         return 'unknown'
     return 'ok'
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Return the 3xx response as-is instead of following it (Node: manual)."""
+    """Вернуть ответ 3xx как есть, не следуя редиректу (аналог manual в Node)."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
 def url_headers(address, timeout):
-    """HEAD the URL (GET on 405/501) and return 'Server\\nX-Powered-By'."""
+    """HEAD-запрос к URL (GET при 405/501) и возврат строки 'Server\\nX-Powered-By'."""
     if re.search(r'[\x00-\x20\x7f]', address):
-        raise ValueError('URL contains spaces or control characters')
+        raise ValueError('URL содержит пробелы или управляющие символы')
     parts = urllib.parse.urlsplit(address)
     if parts.scheme not in ('http', 'https'):
-        raise ValueError('Use an http:// or https:// URL')
+        raise ValueError('Используйте URL вида http:// или https://')
     if parts.username or parts.password or parts.fragment:
-        raise ValueError('URL credentials and fragments are not supported')
+        raise ValueError('Учётные данные и фрагменты в URL не поддерживаются')
 
     opener = urllib.request.build_opener(_NoRedirect())
     headers = []
@@ -79,7 +83,7 @@ def url_headers(address, timeout):
         try:
             resp = opener.open(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
-            # urllib raises HTTPError for status >= 400; headers are still there.
+            # urllib оборачивает статусы >= 400 в HTTPError; заголовки в нём есть.
             resp = exc
         headers.append(resp.headers.get('Server') or '')
         headers.append(resp.headers.get('X-Powered-By') or '')
@@ -90,6 +94,7 @@ def url_headers(address, timeout):
 
 
 def _usage_error(message):
+    """Напечатать ошибку с подсказкой по использованию и вернуть код 2."""
     print(message + '\n' + USAGE, file=sys.stderr)
     return 2
 
@@ -107,6 +112,7 @@ def main(argv=None):
     }
     positionals = []
     i = 0
+    # Разбор аргументов вручную — чтобы точно контролировать коды возврата.
     while i < len(args):
         arg = args[i]
         if arg in ('-h', '--help'):
@@ -120,13 +126,13 @@ def main(argv=None):
         elif arg in ('--php', '--timeout'):
             i += 1
             if i >= len(args):
-                return _usage_error(f'{arg} requires a value')
+                return _usage_error(f'Для {arg} требуется значение')
             opts[arg[2:]] = args[i]
         elif arg.startswith('--php=') or arg.startswith('--timeout='):
             key, _, value = arg.partition('=')
             opts[key[2:]] = value
         elif arg.startswith('-') and arg != '-':
-            return _usage_error(f"Unknown option '{arg}'")
+            return _usage_error(f'Неизвестная опция: {arg}')
         else:
             positionals.append(arg)
         i += 1
@@ -141,14 +147,14 @@ def main(argv=None):
     address = positionals[0] if positionals else None
     if len(positionals) > 1 or (opts['local'] and address is not None) \
             or (not opts['local'] and address is None):
-        return _usage_error('Provide a URL or --local, not both')
+        return _usage_error('Укажите либо URL, либо --local (не оба сразу)')
 
     try:
         timeout = float(opts['timeout'])
     except ValueError:
         timeout = float('nan')
     if not opts['local'] and not (0 < timeout <= 60):
-        return _usage_error('--timeout must be greater than 0 and at most 60 seconds')
+        return _usage_error('--timeout должен быть больше 0 и не больше 60 секунд')
 
     version = None
     error = None
@@ -159,7 +165,7 @@ def main(argv=None):
                 [opts['php'], '-v'],
                 capture_output=True, text=True, timeout=10, check=True,
             ).stdout
-            # Local output includes copyright text and may include startup warnings.
+            # Вывод php -v содержит копирайты и может включать предупреждения.
             pattern = re.compile(r'^PHP (\d[^\s,;)]*)', re.MULTILINE)
         else:
             text = url_headers(address, timeout)
@@ -167,7 +173,7 @@ def main(argv=None):
 
         for match in pattern.finditer(text):
             candidate = patch_status(match.group(1))
-            # Do not let an OK banner hide a vulnerable or unrecognized PHP version.
+            # Баннер OK не должен скрывать уязвимую или нераспознанную версию.
             if version is None or candidate == 'vulnerable' or status == 'ok':
                 version = match.group(1)
                 status = candidate
@@ -177,7 +183,7 @@ def main(argv=None):
         error = str(exc)
 
     code = EXIT[status]
-    reason = error or (f'PHP {version}' if version else 'PHP version not found')
+    reason = error or (f'PHP {version}' if version else 'Версия PHP не найдена')
     report = {
         'patch_status': status,
         'php_version': version,
