@@ -1,5 +1,8 @@
 """Тесты для phpcheck.py (порт openai/php2shell-checker)."""
 
+import contextlib
+import io
+import json
 import os
 import sys
 import tempfile
@@ -196,6 +199,141 @@ class BulkScanTests(unittest.TestCase):
 
     def test_usage_missing_file(self):
         self.assertEqual(phpcheck.main(['--file', '/nonexistent/definitely-missing.txt']), 2)
+
+
+class BrotliStatusTests(unittest.TestCase):
+    """CVE-2026-111497: уязвимы 1.0.3–1.2.0, исправления 1.0.10/1.1.1/1.2.1."""
+
+    CASES = {
+        '1.0.2': 'ok',          # уязвимость появилась только в 1.0.3
+        '1.0.3': 'vulnerable',
+        '1.0.9': 'vulnerable',
+        '1.0.10': 'ok',
+        '1.1.0': 'vulnerable',
+        '1.1.1': 'ok',
+        '1.2.0': 'vulnerable',
+        '1.2.1': 'ok',
+        'brotli/1.2.1': 'ok',   # формат curl_version()['brotli_version']
+        'brotli/1.2.0': 'vulnerable',
+        '1.3.0': 'unknown',     # ветка вне таблицы
+        'junk': 'unknown',
+        '': 'unknown',
+        None: 'unknown',
+    }
+
+    def test_brotli_status_table(self):
+        for version, expected in self.CASES.items():
+            with self.subTest(version=version):
+                self.assertEqual(phpcheck.brotli_status(version), expected)
+
+
+class BuildAdvisoriesTests(unittest.TestCase):
+    def _statuses(self, info):
+        return {a['cve']: a['status'] for a in phpcheck.build_advisories(info)}
+
+    def test_all_ok(self):
+        statuses = self._statuses({
+            'upload_progress': '0', 'serialize_handler': 'php_serialize',
+            'curl': True, 'brotli': 'brotli/1.2.1',
+        })
+        self.assertEqual(statuses, {'CVE-2026-115560': 'ok', 'CVE-2026-111497': 'ok'})
+
+    def test_upload_progress_enabled_warns(self):
+        statuses = self._statuses({
+            'upload_progress': '1', 'serialize_handler': 'php_serialize',
+            'curl': True, 'brotli': 'brotli/1.2.1',
+        })
+        self.assertEqual(statuses['CVE-2026-115560'], 'warning')
+
+    def test_php_serialize_handler_noted_in_detail(self):
+        advisories = phpcheck.build_advisories({
+            'upload_progress': '1', 'serialize_handler': 'php',
+            'curl': True, 'brotli': None,
+        })
+        self.assertIn('serialize_handler=php', advisories[0]['detail'])
+
+    def test_no_curl_not_applicable(self):
+        statuses = self._statuses({
+            'upload_progress': '0', 'serialize_handler': 'php_serialize',
+            'curl': False, 'brotli': None,
+        })
+        self.assertEqual(statuses['CVE-2026-111497'], 'not_applicable')
+
+    def test_curl_without_brotli_ok(self):
+        statuses = self._statuses({
+            'upload_progress': '0', 'serialize_handler': 'php_serialize',
+            'curl': True, 'brotli': None,
+        })
+        self.assertEqual(statuses['CVE-2026-111497'], 'ok')
+
+    def test_vulnerable_brotli_warns(self):
+        statuses = self._statuses({
+            'upload_progress': '0', 'serialize_handler': 'php_serialize',
+            'curl': True, 'brotli': 'brotli/1.1.0',
+        })
+        self.assertEqual(statuses['CVE-2026-111497'], 'warning')
+
+    def test_unknown_upload_progress(self):
+        statuses = self._statuses({
+            'upload_progress': 'garbage', 'serialize_handler': 'php_serialize',
+            'curl': True, 'brotli': None,
+        })
+        self.assertEqual(statuses['CVE-2026-115560'], 'unknown')
+
+
+def make_fake_php(payload):
+    """Создать исполняемый «php»: -v печатает версию, -r — заданный JSON."""
+    fd, path = tempfile.mkstemp(suffix='.sh')
+    with os.fdopen(fd, 'w') as f:
+        f.write('#!/bin/sh\n')
+        f.write('if [ "$1" = "-v" ]; then echo "PHP 8.3.36 (cli)"; fi\n')
+        f.write("if [ \"$1\" = \"-r\" ]; then echo '%s'; fi\n" % payload)
+    os.chmod(path, 0o755)
+    return path
+
+
+class LocalAdvisoriesTests(unittest.TestCase):
+    """Сквозная проверка --local: advisories в JSON и коды возврата."""
+
+    def _run_local(self, payload):
+        path = make_fake_php(payload)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = phpcheck.main(['--local', '--php', path, '--json'])
+            return code, json.loads(buf.getvalue())
+        finally:
+            os.unlink(path)
+
+    def test_local_ok_with_advisories(self):
+        code, report = self._run_local(
+            '{"upload_progress":"0","serialize_handler":"php_serialize",'
+            '"curl":true,"brotli":"brotli/1.2.1"}'
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(report['patch_status'], 'ok')
+        self.assertEqual(report['php_version'], '8.3.36')
+        statuses = {a['cve']: a['status'] for a in report['advisories']}
+        self.assertEqual(statuses, {'CVE-2026-115560': 'ok', 'CVE-2026-111497': 'ok'})
+
+    def test_warnings_do_not_change_exit_code(self):
+        code, report = self._run_local(
+            '{"upload_progress":"1","serialize_handler":"php",'
+            '"curl":true,"brotli":"brotli/1.2.0"}'
+        )
+        # Основной вердикт OK (PHP 8.3.36); advisories — только предупреждения.
+        self.assertEqual(code, 0)
+        statuses = {a['cve']: a['status'] for a in report['advisories']}
+        self.assertEqual(statuses,
+                         {'CVE-2026-115560': 'warning', 'CVE-2026-111497': 'warning'})
+
+    def test_missing_php_binary(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = phpcheck.main(['--local', '--php', '/nonexistent/php', '--json'])
+        self.assertEqual(code, 3)
+        report = json.loads(buf.getvalue())
+        self.assertEqual(report['advisories'], [])
 
 
 if __name__ == '__main__':

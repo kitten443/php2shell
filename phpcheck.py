@@ -5,6 +5,11 @@ phpcheck.py — Python 3 порт официального чекера openai/p
 Проверяет сайт по URL, список сайтов из файла или локальный бинарник PHP
 и сообщает, уязвима ли версия к php2shell (CVE-2026-109618 / CVE-2026-109619).
 
+В режиме --local дополнительно проверяются (блок advisories, на код возврата
+не влияет): CVE-2026-115560 (session upload progress, по конфигурации CLI)
+и CVE-2026-111497 (Brotli в cURL). Удалённо эти проверки невозможны:
+ни конфигурация сессий, ни версия Brotli по HTTP-заголовкам не видны.
+
 Коды возврата: 0 — OK, 1 — VULNERABLE, 3 — UNKNOWN, 2 — ошибка аргументов.
 Для списка сайтов код возврата агрегируется по всем результатам.
 Точный порт логики Node.js-версии; оригинал (c) OpenAI, Apache-2.0.
@@ -21,9 +26,10 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 
-# Пороговые версии уязвимости по веткам (данные на 2026-10-20).
+# Пороговые версии уязвимости по веткам (проверено 2026-10-27:
+# новых релизов PHP нет, пропатченные по-прежнему 8.2.35/8.3.36/8.4.27/8.5.12).
 # Новый стабильный патч в перечисленной ветке считается безопасным;
 # ветки, которых нет в таблице, дают статус UNKNOWN.
 VULNERABLE_THROUGH = {
@@ -69,6 +75,116 @@ def patch_status(version):
     if m.group(4) and _DEV_SUFFIX.search(m.group(4)):
         return 'unknown'
     return 'ok'
+
+
+# CVE-2026-111497 (Brotli): уязвимы 1.0.3–1.2.0; исправления — 1.0.10, 1.1.1, 1.2.1.
+# Патч ветки, начиная с которого Brotli считается пропатченным.
+BROTLI_FIXED_PATCH = {'1.0': 10, '1.1': 1, '1.2': 1}
+# Уязвимость появилась в 1.0.3 — более ранние 1.0.x ей не подвержены.
+_BROTLI_VULNERABLE_FROM = (1, 0, 3)
+
+# Извлечение X.Y.Z из строк вида 'brotli/1.2.1' или '1.2.1'.
+_BROTLI_VERSION_RE = re.compile(r'(\d+)\.(\d+)\.(\d+)')
+
+
+def brotli_status(version):
+    """Статус версии Brotli относительно CVE-2026-111497.
+
+    'ok' — не уязвима (пропатчена или старше 1.0.3 не достигла, т.е. < 1.0.3),
+    'vulnerable' — уязвима, 'unknown' — ветка вне таблицы или мусор.
+    """
+    m = _BROTLI_VERSION_RE.search(version or '')
+    if not m:
+        return 'unknown'
+    major, minor, patch = (int(g) for g in m.groups())
+    if (major, minor, patch) < _BROTLI_VULNERABLE_FROM:
+        return 'ok'
+    cutoff = BROTLI_FIXED_PATCH.get(f'{major}.{minor}')
+    if cutoff is None:
+        return 'unknown'
+    return 'ok' if patch >= cutoff else 'vulnerable'
+
+
+def local_runtime_info(php_bin):
+    """Собрать конфигурацию сессий и Brotli из локального PHP (CLI).
+
+    Возвращает dict: upload_progress, serialize_handler, curl (bool), brotli.
+    ВАЖНО: это конфигурация CLI — у PHP-FPM она может отличаться.
+    """
+    code = (
+        'echo json_encode(['
+        '"upload_progress" => ini_get("session.upload_progress.enabled"),'
+        '"serialize_handler" => ini_get("session.serialize_handler"),'
+        '"curl" => function_exists("curl_version"),'
+        '"brotli" => function_exists("curl_version")'
+        ' ? (curl_version()["brotli_version"] ?? null) : null,'
+        ']);'
+    )
+    text = subprocess.run(
+        [php_bin, '-r', code],
+        capture_output=True, text=True, timeout=10, check=True,
+    ).stdout
+    # В stdout могут быть предупреждения расширений — берём последний JSON-объект.
+    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    if not match:
+        raise ValueError('PHP не вернул JSON с конфигурацией')
+    return json.loads(match.group(0))
+
+
+def build_advisories(info):
+    """Построить список advisories по данным local_runtime_info().
+
+    Статусы: ok / warning / unknown / not_applicable.
+    На основной вердикт и код возврата advisories не влияют.
+    """
+    advisories = []
+
+    # CVE-2026-115560: RCE-вектор в session upload progress (advisory PHP 23.10.2026).
+    # Полный фикс ожидается в следующем регулярном релизе PHP; рекомендация —
+    # session.upload_progress.enabled=0. Условие вектора: upload progress включён
+    # и serialize_handler переключается в 'php' в рантайме.
+    up = str(info.get('upload_progress') or '').strip().lower()
+    handler = str(info.get('serialize_handler') or '').strip()
+    item = {'cve': 'CVE-2026-115560', 'title': 'session upload progress'}
+    if up in ('0', 'off', 'no', 'false', ''):
+        item.update(status='ok', detail='session.upload_progress.enabled = 0')
+    elif up in ('1', 'on', 'yes', 'true'):
+        if handler == 'php':
+            item.update(
+                status='warning',
+                detail='upload_progress включён и serialize_handler=php: установите '
+                       'session.upload_progress.enabled=0 до выхода исправления',
+            )
+        else:
+            item.update(
+                status='warning',
+                detail='upload_progress включён: рекомендуется '
+                       'session.upload_progress.enabled=0 до выхода исправления',
+            )
+    else:
+        item.update(status='unknown',
+                    detail='не удалось определить session.upload_progress.enabled')
+    advisories.append(item)
+
+    # CVE-2026-111497: Brotli-декодер (RCE/утечка памяти при распаковке).
+    item = {'cve': 'CVE-2026-111497', 'title': 'Brotli в cURL'}
+    if not info.get('curl'):
+        item.update(status='not_applicable', detail='расширение cURL не загружено')
+    elif info.get('brotli') is None:
+        item.update(status='ok', detail='cURL собран без Brotli — вектор отсутствует')
+    else:
+        raw = str(info['brotli'])
+        status = brotli_status(raw)
+        if status == 'vulnerable':
+            item.update(status='warning',
+                        detail=f'{raw} — уязвим, обновите Brotli до 1.0.10/1.1.1/1.2.1')
+        elif status == 'ok':
+            item.update(status='ok', detail=f'{raw} — не уязвим')
+        else:
+            item.update(status='unknown', detail=f'{raw} — версия не распознана')
+    advisories.append(item)
+
+    return advisories
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -334,16 +450,33 @@ def main(argv=None):
         status, version, error = check_local(opts['php'])
         code = EXIT[status]
         reason = error or (f'PHP {version}' if version else 'Версия PHP не найдена')
+        # Дополнительные CVE: конфигурация сессий и Brotli (только локально).
+        advisories = []
+        advisories_error = None
+        if error is None:
+            try:
+                advisories = build_advisories(local_runtime_info(opts['php']))
+            except Exception as exc:
+                advisories_error = str(exc)
         report = {
             'patch_status': status,
             'php_version': version,
             'reason': reason,
             'exit_code': code,
+            'advisories': advisories,
         }
+        if advisories_error:
+            report['advisories_error'] = advisories_error
         if opts['json']:
             print(json.dumps(report, ensure_ascii=False))
         else:
             print(f'{status.upper()}: {reason}')
+            print('Дополнительные проверки (по конфигурации CLI; у FPM она может отличаться):')
+            for item in advisories:
+                print(f"  {item['cve']} ({item['title']}): "
+                      f"{item['status'].upper()} — {item['detail']}")
+            if advisories_error:
+                print(f'  недоступны: {advisories_error}')
         return code
 
     # Массовое сканирование списка сайтов.
